@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""ocr-lens — перевод области экрана поверх оригинала (как Google Lens).
+
+ЛКМ (тянуть) — выделить область и перевести
+Space        — переключить оригинал / перевод
+C            — скопировать перевод в буфер
+Esc / ПКМ    — закрыть (вернуть оригинал)
+"""
+import json
+import os
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, GtkLayerShell, Pango, PangoCairo
+
+SRC, DST = "en", "ru"
+OCR_LANG = "eng"
+UPSCALE = 2
+MIN_CONF = 30
+FONT = "Sans"
+
+DATA_DIR = os.path.expanduser("~/.local/share/ocr-lens")
+VENV_PY = os.path.join(DATA_DIR, "venv/bin/python")
+DAEMON_SCRIPT = os.path.join(DATA_DIR, "translate_daemon.py")
+SOCK_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or DATA_DIR, "ocr-lens-translate.sock")
+
+
+def take_screenshot(path):
+    cmd = ["grim"]
+    try:
+        mons = json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"]))
+        cmd += ["-o", next(m for m in mons if m.get("focused"))["name"]]
+    except Exception:
+        pass
+    subprocess.run(cmd + [path], check=True)
+
+
+def ocr(pb, x, y, w, h):
+    crop = pb.new_subpixbuf(x, y, w, h).scale_simple(
+        w * UPSCALE, h * UPSCALE, GdkPixbuf.InterpType.BILINEAR)
+    with tempfile.NamedTemporaryFile(suffix=".png") as f:
+        crop.savev(f.name, "png", [], [])
+        out = subprocess.run(["tesseract", f.name, "stdout", "-l", OCR_LANG, "tsv"],
+                             capture_output=True, text=True).stdout
+
+    blocks = {}
+    for row in out.splitlines()[1:]:
+        c = row.split("\t")
+        if len(c) < 12 or c[0] != "5":
+            continue
+        word = c[11].strip()
+        if not word or float(c[10]) < MIN_CONF:
+            continue
+        l, t, ww, hh = (int(v) / UPSCALE for v in c[6:10])
+        b = blocks.setdefault((c[2], c[3]),
+                              {"words": [], "lines": set(), "box": [l, t, l + ww, t + hh]})
+        b["words"].append(word)
+        b["lines"].add(c[4])
+        bx = b["box"]
+        bx[0], bx[1] = min(bx[0], l), min(bx[1], t)
+        bx[2], bx[3] = max(bx[2], l + ww), max(bx[3], t + hh)
+
+    res = []
+    for b in blocks.values():
+        x0, y0, x1, y1 = b["box"]
+        res.append({"text": " ".join(b["words"]), "nlines": len(b["lines"]),
+                    "rect": (x + x0, y + y0, x1 - x0, y1 - y0)})
+    return res
+
+
+def translate(text):
+    """Fallback: online translate-shell, used only if the local daemon is unavailable."""
+    try:
+        r = subprocess.run(["trans", "-b", "-no-autocorrect", f"{SRC}:{DST}", text],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or text
+    except Exception:
+        return text
+
+
+def _connect_daemon(timeout):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(SOCK_PATH)
+    return s
+
+
+def ensure_daemon():
+    try:
+        _connect_daemon(0.3).close()
+        return True
+    except OSError:
+        pass
+    try:
+        subprocess.Popen([VENV_PY, DAEMON_SCRIPT], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        return False
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        time.sleep(0.15)
+        try:
+            _connect_daemon(0.3).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def translate_many(texts):
+    """Batch-translate via the local CTranslate2 daemon; falls back to online trans-shell."""
+    if ensure_daemon():
+        try:
+            s = _connect_daemon(30)
+            s.sendall((json.dumps({"texts": texts}) + "\n").encode())
+            resp = json.loads(s.makefile("r").readline())
+            s.close()
+            if "translations" in resp:
+                return resp["translations"]
+        except Exception:
+            pass
+    with ThreadPoolExecutor(8) as ex:
+        return list(ex.map(translate, texts))
+
+
+def edge_color(pixels, pb, rect):
+    x, y, w, h = map(int, rect)
+    W, H = pb.get_width(), pb.get_height()
+    rs, n = pb.get_rowstride(), pb.get_n_channels()
+    pts = [(x - 3, y - 3), (x + w + 3, y - 3), (x - 3, y + h + 3), (x + w + 3, y + h + 3),
+           (x + w // 2, y - 3), (x + w // 2, y + h + 3), (x - 3, y + h // 2), (x + w + 3, y + h // 2)]
+    acc = [0, 0, 0]
+    for px, py in pts:
+        px, py = min(max(px, 0), W - 1), min(max(py, 0), H - 1)
+        i = py * rs + px * n
+        for j in range(3):
+            acc[j] += pixels[i + j]
+    return tuple(v / len(pts) / 255 for v in acc)
+
+
+def draw_block(cr, blk):
+    x, y, w, h = blk["rect"]
+    pad = 2
+    r, g, b = blk["bg"]
+    cr.set_source_rgb(r, g, b)
+    cr.rectangle(x - pad, y - pad, w + 2 * pad, h + 2 * pad)
+    cr.fill()
+
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    cr.set_source_rgb(*((0, 0, 0) if lum > 0.5 else (1, 1, 1)))
+
+    layout = PangoCairo.create_layout(cr)
+    layout.set_width(int((w + 2 * pad) * Pango.SCALE))
+    layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+    layout.set_text(blk["tr"], -1)
+    desc = Pango.FontDescription.from_string(FONT)
+    size = max(h / blk["nlines"] * 0.8, 6)
+    while True:
+        desc.set_absolute_size(size * Pango.SCALE)
+        layout.set_font_description(desc)
+        if layout.get_pixel_size()[1] <= h + 2 * pad or size <= 6:
+            break
+        size *= 0.9
+    cr.move_to(x - pad, y - pad)
+    PangoCairo.show_layout(cr, layout)
+
+
+def draw_status(cr, text, width):
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(Pango.FontDescription.from_string(f"{FONT} 13"))
+    layout.set_text(text, -1)
+    tw, th = layout.get_pixel_size()
+    x, y = (width - tw) / 2, 20
+    cr.set_source_rgba(0, 0, 0, 0.75)
+    cr.rectangle(x - 12, y - 6, tw + 24, th + 12)
+    cr.fill()
+    cr.set_source_rgb(1, 1, 1)
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, layout)
+
+
+class Lens(Gtk.Window):
+    def __init__(self, shot):
+        super().__init__()
+        self.pb = GdkPixbuf.Pixbuf.new_from_file(shot)
+        self.pixels = self.pb.get_pixels()
+        self.start = self.sel = None
+        self.blocks = []
+        self.status = "Выделите область с текстом  •  Esc — выход"
+        self.show_orig = False
+        self.busy = False
+
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_namespace(self, "ocr-lens")
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        for e in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                  GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(self, e, True)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+        try:
+            GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        except AttributeError:
+            GtkLayerShell.set_keyboard_interactivity(self, True)
+
+        self.area = Gtk.DrawingArea()
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
+                             Gdk.EventMask.BUTTON_RELEASE_MASK |
+                             Gdk.EventMask.POINTER_MOTION_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("button-press-event", self.on_press)
+        self.area.connect("motion-notify-event", self.on_motion)
+        self.area.connect("button-release-event", self.on_release)
+        self.add(self.area)
+
+        self.connect("key-press-event", self.on_key)
+        self.connect("realize", lambda w: w.get_window().set_cursor(
+            Gdk.Cursor.new_from_name(w.get_display(), "crosshair")))
+        self.connect("destroy", Gtk.main_quit)
+
+    def k(self):
+        return self.area.get_allocated_width() / self.pb.get_width()
+
+    def on_press(self, _, ev):
+        if ev.button == 3:
+            self.destroy()
+        elif ev.button == 1 and not self.busy:
+            self.start, self.sel, self.blocks = (ev.x, ev.y), None, []
+            self.status = None
+
+    def on_motion(self, _, ev):
+        if self.start:
+            x0, y0 = self.start
+            self.sel = (min(x0, ev.x), min(y0, ev.y), abs(ev.x - x0), abs(ev.y - y0))
+            self.area.queue_draw()
+
+    def on_release(self, _, ev):
+        if ev.button != 1 or not self.start:
+            return
+        self.start = None
+        if self.sel and self.sel[2] > 5 and self.sel[3] > 5:
+            self.run()
+
+    def on_key(self, _, ev):
+        key = Gdk.keyval_name(ev.keyval)
+        if key == "Escape":
+            self.destroy()
+        elif key == "space" and self.blocks:
+            self.show_orig = not self.show_orig
+            self.area.queue_draw()
+        elif key in ("c", "C") and self.blocks:
+            text = "\n\n".join(b["tr"] for b in self.blocks)
+            subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE).communicate(text.encode())
+            self.status = "Скопировано"
+            self.area.queue_draw()
+
+    def run(self):
+        k = self.k()
+        W, H = self.pb.get_width(), self.pb.get_height()
+        x, y, w, h = (int(v / k) for v in self.sel)
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, W - x), min(h, H - y)
+        self.busy, self.status, self.show_orig = True, "Распознаю и перевожу…", False
+        self.area.queue_draw()
+        threading.Thread(target=self.work, args=(x, y, w, h), daemon=True).start()
+
+    def work(self, x, y, w, h):
+        blocks = ocr(self.pb, x, y, w, h)
+        if not blocks:
+            GLib.idle_add(self.done, [], "Текст не найден")
+            return
+        trs = translate_many([b["text"] for b in blocks])
+        for b, t in zip(blocks, trs):
+            b["tr"] = t
+            b["bg"] = edge_color(self.pixels, self.pb, b["rect"])
+        GLib.idle_add(self.done, blocks, None)
+
+    def done(self, blocks, status):
+        self.busy, self.blocks, self.status = False, blocks, status
+        self.area.queue_draw()
+        return False
+
+    def on_draw(self, _, cr):
+        k = self.k()
+        W = self.area.get_allocated_width()
+        H = self.area.get_allocated_height()
+
+        cr.save()
+        cr.scale(k, k)
+        Gdk.cairo_set_source_pixbuf(cr, self.pb, 0, 0)
+        cr.paint()
+        if self.blocks and not self.show_orig:
+            for b in self.blocks:
+                draw_block(cr, b)
+        cr.restore()
+
+        if not self.blocks:
+            cr.set_source_rgba(0, 0, 0, 0.35)
+            if self.sel:
+                x, y, w, h = self.sel
+                for r in ((0, 0, W, y), (0, y + h, W, H - y - h),
+                          (0, y, x, h), (x + w, y, W - x - w, h)):
+                    cr.rectangle(*r)
+                cr.fill()
+                cr.set_source_rgb(1, 1, 1)
+                cr.set_line_width(1)
+                cr.rectangle(x + 0.5, y + 0.5, w, h)
+                cr.stroke()
+            else:
+                cr.paint()
+
+        if self.status:
+            draw_status(cr, self.status, W)
+
+
+if __name__ == "__main__":
+    fd, shot = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        take_screenshot(shot)
+        Lens(shot).show_all()
+        Gtk.main()
+    finally:
+        os.remove(shot)
