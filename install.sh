@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # Установщик ocr-lens.
 #   ./install.sh               — установить / обновить
+#   ./install.sh --no-llm      — без локальной LLM (офлайн-перевод не будет работать)
 #   ./install.sh --uninstall   — удалить
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/ocr-lens"
-VENV="$DATA_DIR/venv"
+LLM_DIR="$DATA_DIR/llm"
+LLAMA_DIR="$DATA_DIR/llama"
+MODEL_FILE="qwen2.5-3b-instruct-q4_k_m.gguf"
+MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/$MODEL_FILE"
 CMD="$BIN_DIR/ocr-lens"
 
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*"; }
 die()  { printf '\033[1;31mОшибка:\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { [ -r /dev/tty ] || return 1; read -r -p "$1 [y/N] " a < /dev/tty; [[ "$a" =~ ^[YyДд]$ ]]; }
+ask_yes() { [ -r /dev/tty ] || return 0; read -r -p "$1 [Y/n] " a < /dev/tty; [[ ! "$a" =~ ^[NnНн]$ ]]; }
 
 # ---------- удаление ----------
 if [ "${1:-}" = "--uninstall" ]; then
   pkill -f "$DATA_DIR/translate_daemon.py" 2>/dev/null || true
+  pkill -f "$LLAMA_DIR/.*/llama-server" 2>/dev/null || true
   rm -f "$CMD"
   rm -rf "$DATA_DIR"
   say "ocr-lens удалён. Системные пакеты и строка хоткея в конфиге не тронуты."
@@ -25,7 +31,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 [ "$(id -u)" -ne 0 ] || die "запускайте без sudo — пароль спросится только для системных пакетов."
-for f in ocr-lens translate_daemon.py requirements.txt; do
+for f in ocr-lens translate_daemon.py; do
   [ -f "$SRC_DIR/$f" ] || die "не найден $f рядом с install.sh"
 done
 
@@ -43,25 +49,21 @@ esac
 say "Установка системных пакетов"
 if command -v pacman >/dev/null; then
   sudo pacman -S --needed --noconfirm python python-gobject python-cairo gtk3 gtk-layer-shell \
-    grim tesseract tesseract-data-eng wl-clipboard
-  sudo pacman -S --needed --noconfirm translate-shell || true
+    grim tesseract tesseract-data-eng wl-clipboard curl
 elif command -v apt-get >/dev/null; then
   sudo apt-get update
-  sudo apt-get install -y python3 python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-    gir1.2-gtklayershell-0.1 grim tesseract-ocr tesseract-ocr-eng wl-clipboard
-  sudo apt-get install -y translate-shell || true
+  sudo apt-get install -y python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+    gir1.2-gtklayershell-0.1 grim tesseract-ocr tesseract-ocr-eng wl-clipboard curl
 elif command -v dnf >/dev/null; then
   sudo dnf install -y python3 python3-gobject python3-cairo gtk3 gtk-layer-shell \
-    grim tesseract tesseract-langpack-eng wl-clipboard
-  sudo dnf install -y translate-shell || true
+    grim tesseract tesseract-langpack-eng wl-clipboard curl
 elif command -v zypper >/dev/null; then
   sudo zypper --non-interactive install python3 python3-gobject python3-gobject-cairo \
     python3-gobject-Gdk typelib-1_0-Gtk-3_0 typelib-1_0-GtkLayerShell-0_1 \
-    grim tesseract-ocr tesseract-ocr-traineddata-english wl-clipboard
-  sudo zypper --non-interactive install translate-shell || true
+    grim tesseract-ocr tesseract-ocr-traineddata-english wl-clipboard curl
 else
   warn "Неизвестный пакетный менеджер. Установите вручную: PyGObject (GTK3 + cairo),"
-  warn "gtk-layer-shell, grim, tesseract + английская модель, wl-clipboard, python3-venv."
+  warn "gtk-layer-shell, grim, tesseract + английская модель, wl-clipboard, curl."
   ask "Пакеты уже установлены, продолжить?" || exit 1
 fi
 
@@ -81,25 +83,63 @@ command -v grim >/dev/null      || die "grim не установлен"
 command -v tesseract >/dev/null || die "tesseract не установлен"
 tesseract --list-langs 2>&1 | grep -qx eng || die "нет модели tesseract 'eng'"
 
-# ---------- 2. офлайн-перевод ----------
-say "Окружение для офлайн-перевода (в первый раз — несколько минут)"
+# ---------- 2. локальная LLM (офлайн-режим) ----------
+# Онлайн ocr-lens переводит через Google (ничего ставить не нужно). Локальная модель
+# нужна только когда интернета нет.
 mkdir -p "$DATA_DIR" "$BIN_DIR"
-[ -x "$VENV/bin/python" ] || "$SYS_PY" -m venv "$VENV"
-"$VENV/bin/pip" install -q --upgrade pip
-# torch только для CPU, иначе pip скачает CUDA-версию на ~2 ГБ
-"$VENV/bin/pip" install -q --extra-index-url https://download.pytorch.org/whl/cpu \
-  -r "$SRC_DIR/requirements.txt"
+install_llm() {
+  local arch url tmp
+  case "$(uname -m)" in
+    x86_64)        arch=x64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) warn "Архитектура $(uname -m) не поддерживается — локальная LLM пропущена."; return ;;
+  esac
 
-say "Модель перевода en → ru"
-"$VENV/bin/argospm" update
-"$VENV/bin/argospm" install translate-en_ru
+  if ! ls "$LLAMA_DIR"/*/llama-server >/dev/null 2>&1; then
+    say "Загрузка llama.cpp (CPU-сборка)"
+    url="$("$SYS_PY" - "$arch" <<'PY'
+import json, re, sys, urllib.request
+pat = re.compile(r"llama-b\d+-bin-ubuntu-%s\.tar\.gz$" % sys.argv[1])
+rels = json.load(urllib.request.urlopen(
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10", timeout=30))
+for r in rels:
+    for a in r["assets"]:
+        if pat.search(a["name"]):
+            print(a["browser_download_url"]); raise SystemExit
+raise SystemExit(1)
+PY
+    )" || { warn "Не удалось найти сборку llama.cpp — локальная LLM пропущена."; return; }
+    tmp="$(mktemp -d)"
+    curl -fL --progress-bar -o "$tmp/llama.tgz" "$url" || { rm -rf "$tmp"; warn "Не скачалась llama.cpp."; return; }
+    rm -rf "$LLAMA_DIR"; mkdir -p "$LLAMA_DIR"
+    tar xzf "$tmp/llama.tgz" -C "$LLAMA_DIR"
+    rm -rf "$tmp"
+  fi
+
+  if [ ! -f "$LLM_DIR/$MODEL_FILE" ]; then
+    say "Загрузка модели Qwen2.5-3B (~2 ГБ, докачивается при обрыве)"
+    mkdir -p "$LLM_DIR"
+    curl -fL -C - --progress-bar -o "$LLM_DIR/$MODEL_FILE" "$MODEL_URL" \
+      || { warn "Модель не скачалась — запустите ./install.sh ещё раз."; return; }
+  fi
+  say "Локальная LLM готова"
+}
+if [ "${1:-}" = "--no-llm" ]; then
+  warn "Локальная LLM пропущена: без интернета перевод работать не будет."
+elif ask_yes "Скачать локальную LLM (~2 ГБ) для перевода без интернета?"; then
+  install_llm
+else
+  warn "Локальная LLM пропущена: без интернета перевод работать не будет."
+fi
 
 # ---------- 3. файлы ----------
 say "Копирование файлов"
 install -m 644 "$SRC_DIR/translate_daemon.py" "$DATA_DIR/translate_daemon.py"
 { echo "#!$SYS_PY"; sed '1{/^#!/d}' "$SRC_DIR/ocr-lens"; } > "$CMD"
 chmod 755 "$CMD"
+[ "$(head -c 2 "$CMD")" = "#!" ] || die "в $CMD не записался shebang — установка повреждена"
 pkill -f "$DATA_DIR/translate_daemon.py" 2>/dev/null || true   # старый демон перезапустится сам
+pkill -f "$LLAMA_DIR/.*/llama-server" 2>/dev/null || true
 
 # ---------- 4. хоткей ----------
 setup_hotkey() {
